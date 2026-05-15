@@ -7,7 +7,7 @@ import json
 import logging
 import queue
 import uuid
-from typing import Dict, Any, Generator
+from typing import Any, Dict, Generator, List, Optional
 
 import requests
 import websockets
@@ -677,73 +677,94 @@ class RealtimeClientTTS:
         logger.debug("Updated %s = %s", key, value)
 
     async def _update_session(self, timeout=1):
-        """Update session configuration by selectively overriding server defaults."""
+        """Update session configuration by sending an override-only payload.
+
+        Builds the synthesize_session.update payload directly from CLI args
+        instead of round-tripping through self.session_config (the response
+        from POST /v1/realtime/synthesis_sessions). The HTTP response is an
+        InitialSynthesisSessionConfig and includes id/object/client_secret
+        fields that are not part of BaseSynthesisSessionConfig (the type the
+        server expects on the update). Carrying those into the override
+        payload — and the resulting deep-mutation through _safe_update_config
+        — was the root cause of --voice silently failing to take effect
+        against published 26.02 NIMs.
+        """
         logger.info("Updating session configuration...")
         logger.debug("Server default config: %s", self.session_config)
 
-        # Create a copy of the session config from server defaults
-        session_config = self.session_config.copy()
+        session_payload: Dict[str, Any] = {}
+        overrides: List[str] = []
+        requested_voice: Optional[str] = None
+        requested_language: Optional[str] = None
 
-        # Track what we're overriding
-        overrides = []
-
-        # Update input text synthesis - only override if args are provided
-        if hasattr(self.args, 'language_code') and self.args.language_code:
-            self._safe_update_config(session_config, "language_code", self.args.language_code, "input_text_synthesis")
+        # input_text_synthesis: language_code + voice_name
+        input_text_synthesis: Dict[str, Any] = {}
+        if getattr(self.args, "language_code", None):
+            requested_language = self.args.language_code
+            input_text_synthesis["language_code"] = requested_language
             overrides.append("language_code")
-
-        if hasattr(self.args, 'voice') and self.args.voice:
-            self._safe_update_config(session_config, "voice_name", self.args.voice, "input_text_synthesis")
+        if getattr(self.args, "voice", None):
+            requested_voice = self.args.voice
+            input_text_synthesis["voice_name"] = requested_voice
             overrides.append("voice_name")
+        if input_text_synthesis:
+            session_payload["input_text_synthesis"] = input_text_synthesis
 
-        # Update output audio parameters - only override if args are provided
-        if hasattr(self.args, 'sample_rate_hz') and self.args.sample_rate_hz:
-            self._safe_update_config(session_config, "sample_rate_hz", self.args.sample_rate_hz, "output_audio_params")
+        # output_audio_params: sample_rate_hz + audio_format
+        output_audio_params: Dict[str, Any] = {}
+        if getattr(self.args, "sample_rate_hz", None):
+            output_audio_params["sample_rate_hz"] = self.args.sample_rate_hz
             overrides.append("sample_rate_hz")
-
-        if hasattr(self.args, 'encoding') and self.args.encoding:
-            self._safe_update_config(session_config, "audio_format", self.args.encoding, "output_audio_params")
+        if getattr(self.args, "encoding", None):
+            output_audio_params["audio_format"] = self.args.encoding
             overrides.append("audio_format")
+        if output_audio_params:
+            session_payload["output_audio_params"] = output_audio_params
 
-        # Update custom dictionary - only override if args are provided
-        if hasattr(self.args, 'custom_dictionary') and self.args.custom_dictionary:
-            self._safe_update_config(session_config, "custom_dictionary", self.args.custom_dictionary)
+        if getattr(self.args, "custom_dictionary", None):
+            session_payload["custom_dictionary"] = self.args.custom_dictionary
             overrides.append("custom_dictionary")
 
-        # Update zero-shot config - only override if args are provided
-        if (hasattr(self.args, 'zero_shot_audio_prompt_file') and self.args.zero_shot_audio_prompt_file):
+        # zero_shot_config: audio bytes + transcript + quality
+        if getattr(self.args, "zero_shot_audio_prompt_file", None):
+            zero_shot_config: Dict[str, Any] = {}
             try:
-                with open(self.args.zero_shot_audio_prompt_file, 'rb') as f:
+                with open(self.args.zero_shot_audio_prompt_file, "rb") as f:
                     audio_data = f.read()
-                    base64_audio_data = base64.b64encode(audio_data).decode('utf-8')
-                    self._safe_update_config(session_config["zero_shot_config"], "audio_prompt_bytes", base64_audio_data)
-                    logger.info("Zero-shot audio prompt bytes: %s", len(base64_audio_data))
+                base64_audio_data = base64.b64encode(audio_data).decode("utf-8")
+                zero_shot_config["audio_prompt_bytes"] = base64_audio_data
+                logger.info("Zero-shot audio prompt bytes: %s", len(base64_audio_data))
                 overrides.append("zero_shot_audio_prompt_file")
             except Exception as e:
                 logger.warning("Failed to load zero-shot audio prompt: %s", e)
-            
-            if hasattr(self.args, 'zero_shot_audio_prompt_transcript') and self.args.zero_shot_audio_prompt_transcript:
-                self._safe_update_config(session_config["zero_shot_config"], "audio_prompt_transcript", self.args.zero_shot_audio_prompt_transcript)
+
+            if getattr(self.args, "zero_shot_audio_prompt_transcript", None):
+                zero_shot_config["audio_prompt_transcript"] = self.args.zero_shot_audio_prompt_transcript
                 logger.info("Zero-shot audio prompt transcript: %s", self.args.zero_shot_audio_prompt_transcript)
                 overrides.append("zero_shot_transcript")
-            
-            if hasattr(self.args, 'zero_shot_prompt_quality') and self.args.zero_shot_prompt_quality:
-                self._safe_update_config(session_config["zero_shot_config"], "prompt_quality", self.args.zero_shot_prompt_quality)
+
+            if getattr(self.args, "zero_shot_prompt_quality", None):
+                zero_shot_config["prompt_quality"] = self.args.zero_shot_prompt_quality
                 logger.info("Zero-shot quality: %s", self.args.zero_shot_prompt_quality)
                 overrides.append("zero_shot_prompt_quality")
 
-        if hasattr(self.args, 'custom_configuration') and self.args.custom_configuration:
+            if zero_shot_config:
+                session_payload["zero_shot_config"] = zero_shot_config
+
+        if getattr(self.args, "custom_configuration", None):
             custom_config = self._parse_custom_configuration(self.args.custom_configuration)
             if custom_config:
-                session_config["custom_configuration"] = custom_config
+                session_payload["custom_configuration"] = custom_config
                 overrides.append("custom_configuration")
 
-        logger.debug("Overriding parameters: %s", overrides)
+        logger.info("Overriding session parameters: %s", overrides)
+        if requested_voice:
+            logger.info("Requested voice_name=%r", requested_voice)
 
         update_request = {
             "event_id": f"event_{uuid.uuid4()}",
             "type": "synthesize_session.update",
-            "session": session_config
+            "session": session_payload,
         }
 
         await self._send_message(update_request)
@@ -764,6 +785,22 @@ class RealtimeClientTTS:
                 logger.info("Synthesis session updated successfully")
                 self.session_config = response_data["session"]
                 session_updated = True
+                acked = self.session_config.get("input_text_synthesis", {}) if isinstance(self.session_config, dict) else {}
+                acked_voice = acked.get("voice_name")
+                acked_language = acked.get("language_code")
+                if requested_voice and acked_voice and acked_voice != requested_voice:
+                    logger.warning(
+                        "Server applied voice_name=%r, but --voice requested %r. "
+                        "Synthesis will use the server-applied voice.",
+                        acked_voice, requested_voice,
+                    )
+                elif requested_voice:
+                    logger.info("Server confirmed voice_name=%r", acked_voice)
+                if requested_language and acked_language and acked_language != requested_language:
+                    logger.warning(
+                        "Server applied language_code=%r, but --language-code requested %r.",
+                        acked_language, requested_language,
+                    )
             elif event_type == "error":
                 error_info = response_data.get("error", {})
                 logger.error("Error: %s", error_info.get("message", "Unknown error"))
