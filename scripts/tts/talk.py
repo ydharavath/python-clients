@@ -15,7 +15,6 @@ from riva.client.argparse_utils import (
     EXIT_BAD_INPUT,
 )
 from riva.client.proto.riva_audio_pb2 import AudioEncoding
-from riva.client.tts import parse_custom_configuration
 
 def read_file_to_dict(file_path):
     result_dict = {}
@@ -192,7 +191,10 @@ def main() -> int:
         if args.custom_dictionary is not None:
             custom_dictionary_input = read_file_to_dict(args.custom_dictionary)
 
-        custom_configuration_input = parse_custom_configuration(args.custom_configuration)
+        custom_configuration_kwargs = {}
+        if args.custom_configuration:
+            from riva.client.tts import parse_custom_configuration
+            custom_configuration_kwargs['custom_configuration'] = parse_custom_configuration(args.custom_configuration)
 
         print("Generating audio for request...")
         start = time.time()
@@ -203,7 +205,7 @@ def main() -> int:
                 zero_shot_audio_prompt_file=args.zero_shot_audio_prompt_file,
                 zero_shot_quality=(20 if args.zero_shot_quality is None else args.zero_shot_quality),
                 custom_dictionary=custom_dictionary_input,
-                custom_configuration=custom_configuration_input,
+                **custom_configuration_kwargs,
             )
             first = True
             for resp in responses:
@@ -223,7 +225,7 @@ def main() -> int:
                 zero_shot_quality=(20 if args.zero_shot_quality is None else args.zero_shot_quality),
                 custom_dictionary=custom_dictionary_input,
                 zero_shot_transcript=args.zero_shot_transcript,
-                custom_configuration=custom_configuration_input,
+                **custom_configuration_kwargs,
             )
             stop = time.time()
             print(f"Time spent: {(stop - start):.3f}s")
